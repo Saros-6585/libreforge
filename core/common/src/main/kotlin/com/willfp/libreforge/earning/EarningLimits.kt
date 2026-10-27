@@ -135,7 +135,8 @@ object EarningLimits {
         action: (EarningState, EarningPolicy, Long) -> Unit = { _, _, _ -> }
     ) {
         PlayerProfile.load(player).compute(group.key) { raw ->
-            val now = System.currentTimeMillis()
+            val time = System.currentTimeMillis()
+            val elapsedTime = monotonicTimeMillis()
             val policy = group.policy
             val state = try {
                 EarningState.decode(raw)
@@ -143,19 +144,30 @@ object EarningLimits {
                 plugin.logger.log(Level.WARNING, "Resetting invalid earning limit ${group.key.key} for $player", exception)
                 EarningState()
             }
-            resetIfExpiredBeforeStartup(state)
-            state.applyPolicy(policy, now)
-            action(state, policy, now)
+            applyPolicy(player, group, policy, state, time, elapsedTime)
+            action(state, policy, time)
 
-            scheduler.schedule(player, group, policy, state)
+            scheduler.schedule(player, group, policy, state, time, elapsedTime)
             state.encode()
         }
     }
 
-    private fun resetIfExpiredBeforeStartup(state: EarningState) {
-        if (state.checkedAt < startedAt && state.expiresAt != 0L && state.expiresAt <= startedAt) {
+    private fun applyPolicy(
+        player: UUID,
+        group: EarningLimitGroup,
+        policy: EarningPolicy,
+        state: EarningState,
+        time: Long,
+        elapsedTime: Long
+    ) {
+        val remainingMillis = scheduler.getRemainingIntervalMillis(player, group, policy, state, elapsedTime)
+        if (remainingMillis != null) {
+            state.expiresAt = time + remainingMillis
+        } else if (state.checkedAt < startedAt && state.expiresAt != 0L && state.expiresAt <= minOf(startedAt, time)) {
             state.reset()
         }
+
+        state.applyPolicy(policy, time)
     }
 
     internal fun refresh(player: UUID, group: EarningLimitGroup) {
@@ -163,10 +175,7 @@ object EarningLimits {
     }
 
     internal fun getState(player: OfflinePlayer, id: String): EarningState? {
-        return groups[id]?.let { getState(player, it) }
-    }
-
-    private fun getState(player: OfflinePlayer, group: EarningLimitGroup): EarningState? {
+        val group = groups[id] ?: return null
         if (!group.active) {
             return null
         }
@@ -176,11 +185,11 @@ object EarningLimits {
             EarningState.decode(PlayerProfile.load(uuid).read(group.key))
         } catch (_: IllegalArgumentException) {
             update(uuid, group)
-            return getState(player, group)
+            return getState(player, id)
         }
 
-        resetIfExpiredBeforeStartup(state)
-        state.applyPolicy(group.policy, System.currentTimeMillis())
+        val time = System.currentTimeMillis()
+        applyPolicy(uuid, group, group.policy, state, time, monotonicTimeMillis())
         return state
     }
 

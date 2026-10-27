@@ -24,7 +24,7 @@ internal data class EarningState(
     }
 
     fun applyPolicy(policy: EarningPolicy, time: Long) {
-        val now = maxOf(time, checkedAt)
+        val now = if (policy.cron == null) time else maxOf(time, checkedAt)
 
         if (policy.cron != null) {
             val lastCheck = maxOf(checkedAt, policy.cronChangedAt)

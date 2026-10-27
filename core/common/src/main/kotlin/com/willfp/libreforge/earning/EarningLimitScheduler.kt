@@ -5,13 +5,18 @@ import com.willfp.eco.core.scheduling.EcoTask
 import com.willfp.libreforge.plugin
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.logging.Level
 
 internal class EarningLimitScheduler {
-    private data class Reset(val player: UUID?, val group: EarningLimitGroup)
+    private data class PlayerGroup(val player: UUID, val group: EarningLimitGroup)
 
-    /** Scheduled reset timestamps in epoch milliseconds, per player or cron group. */
-    private val scheduledResetTimes = ConcurrentHashMap<Reset, Long>()
+    private data class IntervalReset(val expiresAt: Long, val elapsedExpiresAt: Long) {
+        fun remainingMillis(elapsedTime: Long): Long = elapsedExpiresAt - elapsedTime
+    }
+
+    private val cronResets = ConcurrentHashMap<EarningLimitGroup, Long>()
+    private val intervalResets = ConcurrentHashMap<PlayerGroup, IntervalReset>()
 
     @Volatile
     private var task: EcoTask? = null
@@ -25,8 +30,11 @@ internal class EarningLimitScheduler {
     fun reload(groups: Collection<EarningLimitGroup>) {
         if (task?.isCancelled != false) return
 
-        scheduledResetTimes.keys.removeIf { reset ->
-            !reset.group.active || (reset.player == null) != (reset.group.policy.cron != null)
+        cronResets.keys.removeIf { group ->
+            !group.active || group.policy.cron == null
+        }
+        intervalResets.keys.removeIf { (_, group) ->
+            !group.active || group.policy.cron != null
         }
 
         plugin.scheduler.async().run {
@@ -64,24 +72,54 @@ internal class EarningLimitScheduler {
         }
     }
 
-    fun schedule(player: UUID, group: EarningLimitGroup, policy: EarningPolicy, state: EarningState) {
+    /** Remaining interval time in milliseconds, independent of server clock adjustments. */
+    fun getRemainingIntervalMillis(
+        player: UUID,
+        group: EarningLimitGroup,
+        policy: EarningPolicy,
+        state: EarningState,
+        elapsedTime: Long
+    ): Long? {
+        if (policy.cron != null || state.expiresAt == 0L) return null
+        val scheduled = intervalResets[PlayerGroup(player, group)] ?: return null
+        if (scheduled.expiresAt != state.expiresAt) return null
+        return scheduled.remainingMillis(elapsedTime)
+    }
+
+    fun schedule(
+        player: UUID,
+        group: EarningLimitGroup,
+        policy: EarningPolicy,
+        state: EarningState,
+        time: Long,
+        elapsedTime: Long
+    ) {
         val pending = state.amount > 0 || (policy.cron == null && state.expiresAt != 0L)
         if (pending) group.players.add(player) else group.players.remove(player)
 
-        val reset = Reset(if (policy.cron == null) player else null, group)
-        scheduledResetTimes.compute(reset) { _, previous ->
+        if (policy.cron != null) {
+            cronResets.compute(group) { _, previous ->
+                if (task == null || !group.active) return@compute previous
+                if (group.policy !== policy) {
+                    plugin.scheduler.async().run { refresh(player, group) }
+                    return@compute previous
+                }
+
+                if (state.expiresAt == 0L || group.players.isEmpty()) return@compute null
+                minOf(previous ?: state.expiresAt, state.expiresAt)
+            }
+            return
+        }
+
+        intervalResets.compute(PlayerGroup(player, group)) { _, previous ->
             if (task == null || !group.active) return@compute previous
             if (group.policy !== policy) {
                 plugin.scheduler.async().run { refresh(player, group) }
                 return@compute previous
             }
 
-            val expiresAt = state.expiresAt.takeIf { it != 0L && (policy.cron == null || group.players.isNotEmpty()) }
-            if (policy.cron != null && expiresAt != null && previous != null) {
-                minOf(previous, expiresAt)
-            } else {
-                expiresAt
-            }
+            if (state.expiresAt == 0L) return@compute null
+            IntervalReset(state.expiresAt, elapsedTime + (state.expiresAt - time))
         }
     }
 
@@ -89,18 +127,21 @@ internal class EarningLimitScheduler {
         if (task == null) return
 
         val now = System.currentTimeMillis()
-        for ((reset, expiresAt) in scheduledResetTimes) {
+        for ((group, expiresAt) in cronResets) {
             if (task == null) return
-            if (expiresAt > now || !scheduledResetTimes.remove(reset, expiresAt)) continue
-
-            if (reset.player != null) {
-                refresh(reset.player, reset.group)
-            } else {
-                for (member in reset.group.players) {
-                    if (task == null) return
-                    refresh(member, reset.group)
-                }
+            if (expiresAt > now || !cronResets.remove(group, expiresAt)) continue
+            for (player in group.players) {
+                if (task == null) return
+                refresh(player, group)
             }
+        }
+
+        val elapsedTime = monotonicTimeMillis()
+        for ((target, scheduled) in intervalResets) {
+            if (task == null) return
+            if (scheduled.remainingMillis(elapsedTime) > 0) continue
+            refresh(target.player, target.group)
+            intervalResets.remove(target, scheduled)
         }
     }
 
@@ -116,6 +157,12 @@ internal class EarningLimitScheduler {
         val current = task
         task = null
         current?.cancel()
-        scheduledResetTimes.clear()
+        for ((player, group) in intervalResets.keys) {
+            refresh(player, group)
+        }
+        cronResets.clear()
+        intervalResets.clear()
     }
 }
+
+internal fun monotonicTimeMillis(): Long = TimeUnit.NANOSECONDS.toMillis(System.nanoTime())
